@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=45"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "memory-agent"
+version = "0.1.0"
+description = "三层记忆系统 Demo — Core / Active / Inactive Memory"
+requires-python = ">=3.9"
+dependencies = [
+    "sentence-transformers>=2.2.0",
+    "numpy>=1.21.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.scripts]
+memory-agent = "memory_agent.cli.main:main"

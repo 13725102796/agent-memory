@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>记忆系统 Demo</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; height: 100vh; display: flex; flex-direction: column; }
+
+/* 顶栏 */
+.header { background: #fff; border-bottom: 1px solid #e0e0e0; padding: 12px 20px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.header h1 { font-size: 18px; color: #333; margin-right: auto; }
+.header button { padding: 6px 14px; border: 1px solid #ddd; border-radius: 6px; background: #fff; color: #555; font-size: 13px; cursor: pointer; transition: all .15s; }
+.header button:hover { background: #f0f0f0; border-color: #ccc; }
+.header button.danger { color: #e53935; border-color: #ffcdd2; }
+.header button.danger:hover { background: #ffebee; }
+
+/* 消息区 */
+.messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+.msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; line-height: 1.6; font-size: 14px; word-break: break-word; white-space: pre-wrap; }
+.msg.user { align-self: flex-end; background: #1976d2; color: #fff; border-bottom-right-radius: 4px; }
+.msg.ai { align-self: flex-start; background: #fff; color: #333; border: 1px solid #e0e0e0; border-bottom-left-radius: 4px; }
+.msg.system { align-self: center; background: #fff3e0; color: #e65100; font-size: 12px; padding: 6px 12px; border-radius: 8px; }
+.typing { align-self: flex-start; color: #999; font-size: 13px; padding: 8px 14px; }
+.typing::after { content: ''; animation: dots 1.2s infinite; }
+@keyframes dots { 0%{content:'.'} 33%{content:'..'} 66%{content:'...'} }
+
+/* 输入区 */
+.input-area { background: #fff; border-top: 1px solid #e0e0e0; padding: 14px 20px; display: flex; gap: 10px; flex-shrink: 0; }
+.input-area textarea { flex: 1; border: 1px solid #ddd; border-radius: 8px; padding: 10px 14px; font-size: 14px; font-family: inherit; resize: none; outline: none; min-height: 44px; max-height: 120px; line-height: 1.5; }
+.input-area textarea:focus { border-color: #1976d2; }
+.input-area button { padding: 0 20px; background: #1976d2; color: #fff; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; transition: background .15s; }
+.input-area button:hover { background: #1565c0; }
+.input-area button:disabled { background: #bbb; cursor: not-allowed; }
+
+/* 侧边面板 */
+.panel-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 10; }
+.panel-overlay.show { display: block; }
+.panel { position: fixed; top: 0; right: -420px; width: 400px; max-width: 85vw; height: 100vh; background: #fff; box-shadow: -2px 0 12px rgba(0,0,0,.1); z-index: 11; transition: right .25s ease; overflow-y: auto; padding: 20px; }
+.panel.show { right: 0; }
+.panel h2 { font-size: 16px; color: #333; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; }
+.panel h2 .close { cursor: pointer; font-size: 20px; color: #999; border: none; background: none; }
+.panel .item { background: #f9f9f9; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; font-size: 13px; line-height: 1.5; }
+.panel .item .label { font-size: 11px; color: #999; margin-bottom: 2px; }
+.panel .item .tier { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+.panel .item .tier.active { background: #e8f5e9; color: #2e7d32; }
+.panel .item .tier.inactive { background: #fff3e0; color: #e65100; }
+.panel .stat-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #f0f0f0; font-size: 14px; }
+.panel .stat-row:last-child { border-bottom: none; }
+.panel .stat-val { font-weight: 600; color: #1976d2; }
+.panel .core-text { background: #f9f9f9; border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+.panel .empty { color: #999; text-align: center; padding: 40px 0; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>记忆系统 Demo</h1>
+  <button onclick="showPanel('stats')">统计</button>
+  <button onclick="showPanel('core')">Core</button>
+  <button onclick="showPanel('memory')">记忆</button>
+  <button onclick="showPanel('packs')">Pack</button>
+  <button onclick="importHistory()">导入记录</button>
+  <button class="danger" onclick="clearAll()">清空</button>
+</div>
+
+<div class="messages" id="messages"></div>
+
+<div class="input-area">
+  <textarea id="input" rows="1" placeholder="输入消息..." onkeydown="handleKey(event)"></textarea>
+  <button id="sendBtn" onclick="send()">发送</button>
+</div>
+
+<div class="panel-overlay" id="overlay" onclick="closePanel()"></div>
+<div class="panel" id="panel">
+  <div id="panelContent"></div>
+</div>
+
+<script>
+const messagesEl = document.getElementById('messages');
+const inputEl = document.getElementById('input');
+const sendBtn = document.getElementById('sendBtn');
+let sending = false;
+
+// 自动调整输入框高度
+inputEl.addEventListener('input', () => {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+});
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+}
+
+function addMsg(role, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = text;
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return div;
+}
+
+function showTyping() {
+  const div = document.createElement('div');
+  div.className = 'typing';
+  div.id = 'typing';
+  div.textContent = '思考中';
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function removeTyping() {
+  const el = document.getElementById('typing');
+  if (el) el.remove();
+}
+
+async function send() {
+  if (sending) return;
+  const text = inputEl.value.trim();
+  if (!text) return;
+
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+  addMsg('user', text);
+
+  sending = true;
+  sendBtn.disabled = true;
+  showTyping();
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text }),
+    });
+
+    removeTyping();
+    const aiMsg = addMsg('ai', '');
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();  // 保留不完整的行
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+          if (data.done) break;
+          if (data.chunk) {
+            fullText += data.chunk;
+            aiMsg.textContent = fullText;
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+          }
+        } catch (e) { /* 忽略解析错误 */ }
+      }
+    }
+
+    if (!fullText) {
+      aiMsg.textContent = '(无回复)';
+      aiMsg.classList.add('system');
+    }
+  } catch (err) {
+    removeTyping();
+    addMsg('system', '网络错误: ' + err.message);
+  } finally {
+    sending = false;
+    sendBtn.disabled = false;
+    inputEl.focus();
+  }
+}
+
+// ── 侧边面板 ────────────────────────────────
+
+function showPanel(type) {
+  document.getElementById('overlay').classList.add('show');
+  document.getElementById('panel').classList.add('show');
+  const content = document.getElementById('panelContent');
+  content.innerHTML = '<div class="empty">加载中...</div>';
+
+  if (type === 'stats') loadStats(content);
+  else if (type === 'memory') loadMemory(content);
+  else if (type === 'packs') loadPacks(content);
+  else if (type === 'core') loadCore(content);
+}
+
+function closePanel() {
+  document.getElementById('overlay').classList.remove('show');
+  document.getElementById('panel').classList.remove('show');
+}
+
+async function loadStats(el) {
+  const data = await fetchAPI('/api/stats');
+  el.innerHTML = `
+    <h2>统计信息 <button class="close" onclick="closePanel()">&times;</button></h2>
+    <div class="stat-row"><span>Core Memory</span><span class="stat-val">${data.core_length > 0 ? data.core_length + ' 字' : '空'}</span></div>
+    <div class="stat-row"><span>Active 记忆</span><span class="stat-val">${data.active_count} 条</span></div>
+    <div class="stat-row"><span>Inactive 记忆</span><span class="stat-val">${data.inactive_count} 条</span></div>
+    <div class="stat-row"><span>Memory Pack</span><span class="stat-val">${data.pack_count} 个</span></div>
+    <div class="stat-row"><span>总计</span><span class="stat-val">${data.active_count + data.inactive_count} 条 + ${data.pack_count} 包</span></div>
+  `;
+}
+
+async function loadMemory(el) {
+  const data = await fetchAPI('/api/memory');
+  const items = data.memories || [];
+  if (!items.length) {
+    el.innerHTML = '<h2>记忆列表 <button class="close" onclick="closePanel()">&times;</button></h2><div class="empty">暂无记忆</div>';
+    return;
+  }
+  let html = '<h2>记忆列表 (' + items.length + ') <button class="close" onclick="closePanel()">&times;</button></h2>';
+  for (const m of items) {
+    html += `<div class="item">
+      <div class="label"><span class="tier ${m.tier}">${m.tier}</span> importance=${m.importance.toFixed(2)} | 命中${m.hit_count}次</div>
+      ${m.content}
+    </div>`;
+  }
+  el.innerHTML = html;
+}
+
+async function loadPacks(el) {
+  const data = await fetchAPI('/api/packs');
+  const items = data.packs || [];
+  if (!items.length) {
+    el.innerHTML = '<h2>Memory Pack <button class="close" onclick="closePanel()">&times;</button></h2><div class="empty">暂无 Pack</div>';
+    return;
+  }
+  let html = '<h2>Memory Pack (' + items.length + ') <button class="close" onclick="closePanel()">&times;</button></h2>';
+  for (const p of items) {
+    const kw = (p.keywords || []).join(', ');
+    html += `<div class="item">
+      <div class="label">[${p.topic}] ${p.turn_count}轮 | ${kw}</div>
+      ${p.summary}
+    </div>`;
+  }
+  el.innerHTML = html;
+}
+
+async function loadCore(el) {
+  const data = await fetchAPI('/api/core');
+  const core = data.core || '';
+  el.innerHTML = `
+    <h2>Core Memory <button class="close" onclick="closePanel()">&times;</button></h2>
+    ${core ? '<div class="core-text">' + escapeHtml(core) + '</div>' : '<div class="empty">Core Memory 为空</div>'}
+  `;
+}
+
+async function clearAll() {
+  if (!confirm('确认清空所有记忆和聊天记录？')) return;
+  const data = await fetchAPI('/api/clear', 'POST');
+  messagesEl.innerHTML = '';
+  addMsg('system', '已清空所有记忆' + (data.packs_deleted ? `（含 ${data.packs_deleted} 个 Pack）` : ''));
+}
+
+async function importHistory() {
+  if (!confirm('从 JSON 文件导入聊天记录？\n将同时在后台提取记忆。')) return;
+  addMsg('system', '正在导入聊天记录...');
+  try {
+    const res = await fetch('/api/import-history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (data.error) {
+      addMsg('system', '导入失败: ' + data.error);
+      return;
+    }
+    // 清空当前消息，重新渲染
+    messagesEl.innerHTML = '';
+    for (const msg of (data.messages || [])) {
+      addMsg(msg.role, msg.content);
+    }
+    addMsg('system', `已导入 ${data.imported} 条记录，${data.pairs} 组对话正在后台提取记忆...`);
+  } catch (err) {
+    addMsg('system', '导入失败: ' + err.message);
+  }
+}
+
+async function loadHistory() {
+  try {
+    const data = await fetchAPI('/api/history');
+    for (const msg of (data.messages || [])) {
+      addMsg(msg.role, msg.content);
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+async function fetchAPI(url, method = 'GET') {
+  const res = await fetch(url, { method });
+  return res.json();
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// 启动时加载历史并聚焦输入框
+loadHistory();
+inputEl.focus();
+</script>
+</body>
+</html>
