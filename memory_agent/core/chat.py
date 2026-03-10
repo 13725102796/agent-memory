@@ -9,7 +9,7 @@ from memory_agent.log import get_logger
 from memory_agent.memory.extract import MemoryExtractor
 from memory_agent.memory.packer import MemoryPacker
 from memory_agent.memory.search import MemorySearcher
-from memory_agent.providers.base import EmbeddingProvider, LLMProvider
+from memory_agent.providers.base import EmbeddingProvider, LLMProvider, RerankerProvider
 from memory_agent.store.base import MemoryStore
 from memory_agent.types import PackSearchResult, SearchResult
 
@@ -19,20 +19,25 @@ log = get_logger("core.chat")
 class ChatHandler:
     """聊天主流程编排，通过构造函数注入所有依赖"""
 
-    MAX_HISTORY = 40  # 安全上限，packer 是主要裁剪机制
-
     def __init__(
         self,
         store: MemoryStore,
         llm: LLMProvider,
         embedder: EmbeddingProvider,
+        reranker: RerankerProvider | None = None,
     ):
         self._store = store
         self._llm = llm
-        self._searcher = MemorySearcher(store, embedder)
+        self._searcher = MemorySearcher(store, embedder, reranker=reranker)
         self._extractor = MemoryExtractor(store, llm, embedder)
         self._packer = MemoryPacker(store, llm, embedder)
         self._history: list[dict] = []
+
+    def load_history(self, user_id: str) -> None:
+        """从数据库加载持久化的对话历史（服务启动时调用）"""
+        self._history = self._store.get_recent_messages(user_id)
+        if self._history:
+            log.info("从数据库恢复 %d 条对话历史", len(self._history))
 
     def handle(self, user_id: str, message: str) -> str:
         """
@@ -73,12 +78,12 @@ class ChatHandler:
         log.info("调用 Claude ...")
         reply = self._llm.chat(system_prompt, full_message)
 
-        # ⑤ 记录对话历史（带时间戳）
+        # ⑤ 记录对话历史（带时间戳）+ 持久化到 DB
         _ts = time.time()
         self._history.append({"role": "user", "content": message, "ts": _ts})
         self._history.append({"role": "assistant", "content": reply, "ts": _ts})
-        if len(self._history) > self.MAX_HISTORY * 2:
-            self._history = self._history[-(self.MAX_HISTORY * 2):]
+        self._store.append_message(user_id, "user", message, _ts)
+        self._store.append_message(user_id, "assistant", reply, _ts)
 
         # ⑥⑦ 后台异步：压缩打包 + 提取记忆（均不阻塞回复）
         threading.Thread(
@@ -120,12 +125,12 @@ class ChatHandler:
 
         reply = "".join(chunks)
 
-        # ⑤ 记录对话历史
+        # ⑤ 记录对话历史 + 持久化到 DB
         _ts = time.time()
         self._history.append({"role": "user", "content": message, "ts": _ts})
         self._history.append({"role": "assistant", "content": reply, "ts": _ts})
-        if len(self._history) > self.MAX_HISTORY * 2:
-            self._history = self._history[-(self.MAX_HISTORY * 2):]
+        self._store.append_message(user_id, "user", message, _ts)
+        self._store.append_message(user_id, "assistant", reply, _ts)
 
         # ⑥⑦ 后台异步
         threading.Thread(
@@ -135,14 +140,16 @@ class ChatHandler:
         ).start()
 
     def _bg_post_process(self, user_id: str, message: str, reply: str) -> None:
-        """后台线程：压缩打包 + 提取记忆"""
+        """后台线程：先压缩打包（获取 pack_id），再提取记忆（关联 pack_id）"""
+        log.info("后台处理开始: %s", message[:40])
+        pack_id = None
         try:
-            self._history = self._packer.maybe_compress(user_id, self._history)
+            pack_id, self._history = self._packer.maybe_compress(user_id, self._history)
         except Exception:
             log.exception("后台压缩打包异常")
         try:
-            self._extractor.extract_and_save(user_id, message, reply)
-            log.debug("记忆提取完成")
+            self._extractor.extract_and_save(user_id, message, reply, pack_id=pack_id)
+            log.info("记忆提取完成")
         except Exception:
             log.exception("后台记忆提取异常")
 

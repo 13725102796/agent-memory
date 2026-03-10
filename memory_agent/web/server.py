@@ -14,6 +14,7 @@ from memory_agent.log import get_logger
 from memory_agent.memory.lifecycle import MemoryLifecycle
 from memory_agent.providers.embedding_local import LocalEmbeddingProvider
 from memory_agent.providers.llm_claude_cli import ClaudeCLIProvider
+from memory_agent.providers.reranker_local import LocalRerankerProvider
 from memory_agent.store.sqlite import SQLiteMemoryStore
 
 log = get_logger("web.server")
@@ -32,10 +33,13 @@ def _create_app() -> tuple[ChatHandler, SQLiteMemoryStore, str]:
     store.init()
     embedder = LocalEmbeddingProvider()
     embedder._load()  # 启动时预加载模型
+    reranker = LocalRerankerProvider()
+    reranker._load()  # 预加载 reranker 模型
     llm = ClaudeCLIProvider()
-    handler = ChatHandler(store=store, llm=llm, embedder=embedder)
-    lifecycle = MemoryLifecycle(store=store)
+    handler = ChatHandler(store=store, llm=llm, embedder=embedder, reranker=reranker)
     user_id = settings.default_user_id
+    handler.load_history(user_id)
+    lifecycle = MemoryLifecycle(store=store)
     lifecycle.run(user_id)
     return handler, store, user_id
 

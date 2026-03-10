@@ -7,7 +7,7 @@ import numpy as np
 
 from memory_agent.config import settings
 from memory_agent.log import get_logger
-from memory_agent.providers.base import EmbeddingProvider
+from memory_agent.providers.base import EmbeddingProvider, RerankerProvider
 from memory_agent.store.base import MemoryStore
 from memory_agent.types import MemoryRecord, PackSearchResult, SearchResult
 
@@ -17,18 +17,20 @@ log = get_logger("memory.search")
 class MemorySearcher:
     """混合检索 + Pack 关联投票"""
 
-    def __init__(self, store: MemoryStore, embedder: EmbeddingProvider):
+    def __init__(self, store: MemoryStore, embedder: EmbeddingProvider, reranker: RerankerProvider | None = None):
         self._store = store
         self._embedder = embedder
+        self._reranker = reranker
 
     def search(
         self, user_id: str, query: str,
     ) -> tuple[list[SearchResult], list[PackSearchResult]]:
         """
-        三阶段检索：
+        检索流程：
         Stage 1a: 向量搜索 Active + Inactive
         Stage 1b: BM25 全文搜索
-        Stage 1c: 归一化 + 加权合并
+        Stage 1c: 归一化 + 加权合并（粗排）
+        Stage 1d: Reranker 精排（可选）
         Stage 2:  按 pack_id 聚合投票 → Top-N Pack
         """
         _t = time.time()
@@ -43,26 +45,33 @@ class MemorySearcher:
         bm25_hits = self._store.fts_search(query, user_id, limit=20)
         _t_bm25 = time.time()
 
-        # ── Stage 1c: 归一化 + 加权合并 ──
+        # ── Stage 1c: 粗排合并（reranker 模式下多取候选） ──
         merged = self._merge_scores(vector_hits, bm25_hits, user_id)
+        _t_merge = time.time()
+
+        # ── Stage 1d: Reranker 精排 ──
+        _t_rerank = _t_merge
+        if self._reranker and merged:
+            merged = self._rerank(query, merged)
+            _t_rerank = time.time()
 
         # 记录命中
         for h in merged:
             self._store.record_hit(h.id)
-        _t_merge = time.time()
 
         if merged:
-            log.info("混合检索命中 %d 条记忆", len(merged))
+            log.info("最终命中 %d 条记忆", len(merged))
 
         # ── Stage 2: 按 pack_id 聚合投票 ──
         packs = self._aggregate_packs(merged)
         _t_pack = time.time()
 
+        rerank_ms = (_t_rerank - _t_merge) * 1000 if self._reranker else 0
         log.info(
-            "检索耗时明细: embed=%.1fms | vector=%.1fms | bm25=%.1fms | merge+hit=%.1fms | pack=%.1fms",
+            "检索耗时明细: embed=%.1fms | vector=%.1fms | bm25=%.1fms | merge=%.1fms | rerank=%.1fms | pack=%.1fms",
             (_t_embed - _t) * 1000, (_t_vec - _t_embed) * 1000,
             (_t_bm25 - _t_vec) * 1000, (_t_merge - _t_bm25) * 1000,
-            (_t_pack - _t_merge) * 1000,
+            rerank_ms, (_t_pack - _t_rerank) * 1000,
         )
 
         if packs:
@@ -135,7 +144,39 @@ class MemorySearcher:
             ))
 
         results.sort(key=lambda x: x.score, reverse=True)
-        return results[:settings.search_top_k]
+        # reranker 模式：多取候选给精排；否则直接取 top_k
+        limit = settings.reranker_candidates if self._reranker else settings.search_top_k
+        return results[:limit]
+
+    def _rerank(self, query: str, candidates: list[SearchResult]) -> list[SearchResult]:
+        """Cross-Encoder 精排：用 reranker 重新打分，过滤低分结果"""
+        documents = [c.content for c in candidates]
+        scores = self._reranker.rerank(query, documents)
+
+        # 记录 rerank 前后分数对比
+        for candidate, rerank_score in zip(candidates, scores):
+            log.info("  rerank: 粗排=%.2f → 精排=%.4f | %s",
+                     candidate.score, rerank_score, candidate.content[:60])
+
+        # 用 reranker 分数替换粗排分数
+        reranked: list[SearchResult] = []
+        for candidate, rerank_score in zip(candidates, scores):
+            if rerank_score >= settings.reranker_min_score:
+                reranked.append(SearchResult(
+                    id=candidate.id,
+                    content=candidate.content,
+                    score=rerank_score,
+                    tier=candidate.tier,
+                    pack_id=candidate.pack_id,
+                ))
+
+        reranked.sort(key=lambda x: x.score, reverse=True)
+        reranked = reranked[:settings.search_top_k]
+
+        if not reranked:
+            log.info("  rerank: 所有候选分数低于阈值 %.2f，无结果", settings.reranker_min_score)
+
+        return reranked
 
     def _load_record(self, memory_id: str, user_id: str) -> MemoryRecord | None:
         """加载 BM25 独有命中的记忆（向量搜索未返回的）"""

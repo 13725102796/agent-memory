@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     hybrid_vector_weight: float = 0.7
     hybrid_bm25_weight: float = 0.3
 
+    # Reranker 精排
+    reranker_model: str = "BAAI/bge-reranker-base"
+    reranker_min_score: float = 0.01
+    reranker_candidates: int = 10
+
 
 # 全局单例
 settings = Settings()

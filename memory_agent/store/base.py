@@ -111,6 +111,20 @@ class MemoryStore(ABC):
     def fts_search(self, query: str, user_id: str, limit: int = 20) -> list[tuple[str, float]]:
         ...
 
+    # ── 对话消息持久化 ─────────────────────────────────────
+
+    @abstractmethod
+    def append_message(self, user_id: str, role: str, content: str, ts: float) -> None:
+        ...
+
+    @abstractmethod
+    def get_recent_messages(self, user_id: str, limit: int = 80) -> list[dict]:
+        ...
+
+    @abstractmethod
+    def mark_messages_packed(self, user_id: str, before_ts: float) -> int:
+        ...
+
     # ── 初始化 ────────────────────────────────────────────
 
     @abstractmethod

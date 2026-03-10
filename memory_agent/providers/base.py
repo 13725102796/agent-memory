@@ -20,6 +20,15 @@ class EmbeddingProvider(ABC):
         ...
 
 
+class RerankerProvider(ABC):
+    """Reranker 提供者接口"""
+
+    @abstractmethod
+    def rerank(self, query: str, documents: list[str]) -> list[float]:
+        """对 (query, doc) 对打分，返回与 documents 等长的分数列表"""
+        ...
+
+
 class LLMProvider(ABC):
     """LLM 提供者接口"""
 

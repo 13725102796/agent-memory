@@ -26,32 +26,61 @@ class MemoryExtractor:
         self._llm = llm
         self._embedder = embedder
 
-    def extract_and_save(self, user_id: str, user_msg: str, assistant_reply: str):
-        prompt = f"""从这段对话中提取值得长期记住的信息。
+    def extract_and_save(self, user_id: str, user_msg: str, assistant_reply: str, pack_id: str | None = None):
+        log.info("开始提取记忆: 用户消息=%s (pack_id=%s)", user_msg[:60], pack_id)
 
-分两类输出 JSON（严格 JSON 格式，不要 markdown 代码块）：
+        # A. 对话原文 → 直接存为 memory（作为检索索引，不依赖 LLM）
+        pair_content = f"用户: {user_msg[:200]} | AI: {assistant_reply[:200]}"
+        self._upsert(user_id, pair_content, importance=0.4, pack_id=pack_id)
+        prompt = f"""从这段对话中提取可能在未来对话中有用的信息。
+
+输出 JSON（严格 JSON，不要 markdown 代码块）：
 {{
-  "core": "持久性偏好/身份信息，如有则填写，无则为null",
+  "core": "用户身份/持久偏好信息，无则null",
   "memories": [
-    {{"content": "具体事实/决策/方案", "importance": 0.5}}
+    {{"content": "一句话描述具体信息", "importance": 0.3到0.9}}
   ]
 }}
 
-分类标准：
-- core: 姓名、语言偏好、技术栈、代码风格、长期规则（如"以后注释用英文"）
-- memories: 具体方案、决策、讨论结论、项目细节
-- 闲聊/问候/临时指令 → 不提取，memories 为空数组，core 为 null
+core 提取范围：姓名、昵称、年龄、性别、所在城市、语言偏好、职业、技术栈、长期习惯或规则
+memories 提取范围（只要包含具体信息就提取）：
+- 计划/行程："下周一去珠海长隆"
+- 偏好/喜好："喜欢吃火锅"、"喜欢听周杰伦"
+- 具体事实："家里有一只猫叫咪咪"
+- 人物关系："女朋友叫小美"
+- 项目/工作细节："正在开发一个记忆系统"
+- 讨论结论/决策："决定用 SQLite 存储"
+- 情绪/健康状态："最近压力很大"、"感冒了"
 
-对话：
+不提取的情况（返回空数组）：纯问候（"你好"、"在吗"）、无实质内容的闲聊（"哈哈"、"嗯嗯"）
+
+示例1 — 有核心信息+具体记忆：
+对话：用户: 我叫小王，下周二要去上海出差  助手: 好的小王，上海最近天气不错
+输出：{{"core": "姓名: 小王", "memories": [{{"content": "用户下周二要去上海出差", "importance": 0.6}}]}}
+
+示例2 — 仅有具体记忆：
+对话：用户: 帮我播一首周杰伦的晴天  助手: 好的，正在播放晴天
+输出：{{"core": null, "memories": [{{"content": "用户喜欢听周杰伦的歌", "importance": 0.4}}]}}
+
+示例3 — 纯闲聊，不提取：
+对话：用户: 哈喽  助手: 你好呀！
+输出：{{"core": null, "memories": []}}
+
+现在提取以下对话：
 用户: {user_msg}
 助手: {assistant_reply[:1000]}
 
-只输出 JSON，不要其他内容："""
+只输出 JSON："""
 
         raw = self._llm.cheap(prompt)
+        log.info("LLM cheap 返回 (%d字符): %s", len(raw), raw[:200])
         parsed = _parse_json(raw)
         if not parsed:
+            log.warning("JSON 解析失败，记忆提取中止。原始输出: %s", raw[:300])
             return
+        log.info("JSON 解析成功: core=%s, memories=%d条",
+                 repr(parsed.get("core"))[:60] if parsed.get("core") else "null",
+                 len(parsed.get("memories", [])))
 
         # Core Memory
         core_fact = parsed.get("core")
@@ -69,7 +98,7 @@ class MemoryExtractor:
             content = item.get("content", "").strip()
             importance = float(item.get("importance", 0.5))
             if content:
-                self._upsert(user_id, content, importance)
+                self._upsert(user_id, content, importance, pack_id=pack_id)
 
     def _update_core(self, user_id: str, new_fact: str):
         current = self._store.get_core_memory(user_id)
@@ -118,7 +147,7 @@ class MemoryExtractor:
                 self._store.fts_delete(rec.id)
                 log.debug("清理矛盾记忆: %s (sim=%.2f)", rec.content[:50], sim)
 
-    def _upsert(self, user_id: str, content: str, importance: float):
+    def _upsert(self, user_id: str, content: str, importance: float, pack_id: str | None = None):
         new_vec = self._embedder.embed(content)
 
         # 找相似的已有记忆
@@ -156,6 +185,7 @@ class MemoryExtractor:
             content=content,
             embedding=new_vec,
             importance=importance,
+            pack_id=pack_id,
         )
         memory_id = self._store.insert_memory(record)
         self._store.fts_sync(memory_id, content)

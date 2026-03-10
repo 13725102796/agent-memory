@@ -75,6 +75,19 @@ class SQLiteMemoryStore(MemoryStore):
 
             CREATE INDEX IF NOT EXISTS idx_packs_user
                 ON memory_packs (user_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                ts         REAL NOT NULL,
+                packed     INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_user
+                ON conversation_messages (user_id, created_at);
         """)
 
         # FTS5 虚拟表需要单独创建（不能放在 executescript 中）
@@ -136,11 +149,11 @@ class SQLiteMemoryStore(MemoryStore):
         embedding_bytes = record.embedding.tobytes() if record.embedding is not None else None
         conn = self._connect()
         conn.execute("""
-            INSERT INTO memories (id, user_id, content, embedding, tier, importance, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO memories (id, user_id, content, embedding, tier, importance, pack_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             memory_id, record.user_id, record.content, embedding_bytes,
-            record.tier, record.importance, _now(), _now(),
+            record.tier, record.importance, record.pack_id, _now(), _now(),
         ))
         conn.commit()
 
@@ -334,6 +347,41 @@ class SQLiteMemoryStore(MemoryStore):
             WHERE user_id = ? AND created_at >= ? AND created_at <= ?
               AND pack_id IS NULL
         """, (pack_id, user_id, start_ts, end_ts))
+        count = cursor.rowcount
+        conn.commit()
+        return count
+
+    # ── 对话消息持久化 ─────────────────────────────────────
+
+    def append_message(self, user_id: str, role: str, content: str, ts: float) -> None:
+        conn = self._connect()
+        conn.execute(
+            "INSERT INTO conversation_messages (user_id, role, content, ts) VALUES (?, ?, ?, ?)",
+            (user_id, role, content, ts),
+        )
+        conn.commit()
+
+    def get_recent_messages(self, user_id: str, limit: int = 80) -> list[dict]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT role, content, ts, packed FROM conversation_messages "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        # 返回时间正序
+        return [
+            {"role": row["role"], "content": row["content"],
+             "ts": row["ts"], "packed": bool(row["packed"])}
+            for row in reversed(rows)
+        ]
+
+    def mark_messages_packed(self, user_id: str, before_ts: float) -> int:
+        conn = self._connect()
+        cursor = conn.execute(
+            "UPDATE conversation_messages SET packed = 1 "
+            "WHERE user_id = ? AND ts <= ? AND packed = 0",
+            (user_id, before_ts),
+        )
         count = cursor.rowcount
         conn.commit()
         return count

@@ -42,17 +42,17 @@ class MemoryPacker:
 
     def maybe_compress(
         self, user_id: str, history: list[dict],
-    ) -> list[dict]:
+    ) -> tuple[str | None, list[dict]]:
         """
         检查并执行压缩。由 ChatHandler 后台线程调用。
-        返回（可能被裁剪的）history。
+        返回 (pack_id, history)：pack_id 为新建的 Pack ID（未触发时为 None）。
         跳过已标记 packed=True 的条目（如导入的历史记录）。
         """
         # 只统计未打包的条目
         unpacked = [e for e in history if not e.get("packed")]
         turn_count = len(unpacked) // 2
         if turn_count < settings.pack_trigger_turns:
-            return history
+            return None, history
 
         # 在未打包的条目中寻找断点
         break_idx = _find_break_point(unpacked)
@@ -60,7 +60,7 @@ class MemoryPacker:
 
         segment = unpacked[:break_idx]
         if not segment:
-            return history
+            return None, history
 
         # 记录时间范围用于回填 pack_id
         start_ts = _entry_ts_iso(segment[0])
@@ -69,16 +69,19 @@ class MemoryPacker:
         pack = self._compress_segment(user_id, segment)
         if pack is None:
             log.warning("压缩失败，跳过")
-            return history
+            return None, history
 
         self._store.insert_pack(pack)
         log.info("Pack 已存储: id=%s, turns=%d, topic=%s", pack.id, pack.turn_count, pack.topic)
 
-        # 回填关联
+        # 回填关联：已有记忆 + DB 消息标记
         if start_ts and end_ts:
             linked = self._store.link_memories_to_pack(user_id, start_ts, end_ts, pack.id)
             if linked:
                 log.info("回填 pack_id 到 %d 条记忆", linked)
+        end_ts_float = segment[-1].get("ts", 0.0)
+        if end_ts_float:
+            self._store.mark_messages_packed(user_id, end_ts_float)
 
         # 将已压缩的条目标记为 packed，而非直接裁剪
         segment_set = set(id(e) for e in segment)
@@ -87,7 +90,7 @@ class MemoryPacker:
                 entry["packed"] = True
         log.info("已标记 %d 条目为 packed", len(segment))
 
-        return history
+        return pack.id, history
 
     def _compress_segment(
         self, user_id: str, segment: list[dict],
