@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
+import urllib.parse
 from functools import partial
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from memory_agent.config import settings
 from memory_agent.core.chat import ChatHandler
 from memory_agent.log import get_logger
+from memory_agent.memory.extract import MemoryExtractor
 from memory_agent.memory.lifecycle import MemoryLifecycle
 from memory_agent.providers.embedding_local import LocalEmbeddingProvider
 from memory_agent.providers.llm_claude_cli import ClaudeCLIProvider
@@ -27,8 +30,12 @@ _HISTORY_JSON = os.path.realpath(os.path.join(
 
 _HTML_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 设备 API 路由正则
+_DEVICE_RE = re.compile(r'^/api/device/([^/]+)/(history|memories|stats|core)$')
+_VOLCANO_RE = re.compile(r'^/api/volcano/callback')
 
-def _create_app() -> tuple[ChatHandler, SQLiteMemoryStore, str]:
+
+def _create_app():
     store = SQLiteMemoryStore()
     store.init()
     embedder = LocalEmbeddingProvider()
@@ -41,16 +48,71 @@ def _create_app() -> tuple[ChatHandler, SQLiteMemoryStore, str]:
     handler.load_history(user_id)
     lifecycle = MemoryLifecycle(store=store)
     lifecycle.run(user_id)
-    return handler, store, user_id
+
+    # 火山引擎回调组件（按需初始化）
+    assembler = None
+    extractor = MemoryExtractor(store, llm, embedder)
+    if settings.volcano_enabled:
+        from memory_agent.volcano.assembler import SubtitleAssembler
+        assembler = SubtitleAssembler(flush_timeout_sec=settings.volcano_flush_timeout_sec)
+        log.info("火山引擎字幕回调已启用")
+
+        # 定时刷新超时缓冲区
+        def _flush_loop():
+            while True:
+                time.sleep(settings.volcano_flush_timeout_sec)
+                try:
+                    flushed = assembler.flush_inactive()
+                    for device_id, user_text, bot_text in flushed:
+                        _bg_extract_device(store, extractor, device_id, user_text, bot_text)
+                    assembler.cleanup_stale_devices()
+                except Exception:
+                    log.exception("定时刷新异常")
+        threading.Thread(target=_flush_loop, daemon=True).start()
+
+    return handler, store, user_id, extractor, assembler
+
+
+def _bg_extract_device(
+    store: SQLiteMemoryStore,
+    extractor: MemoryExtractor,
+    device_id: str,
+    user_text: str,
+    bot_text: str,
+):
+    """后台线程：存储对话消息并提取记忆"""
+    def _run():
+        try:
+            now = time.time()
+            if user_text:
+                store.append_message(device_id, "user", user_text, now)
+            if bot_text:
+                store.append_message(device_id, "assistant", bot_text, now)
+            if user_text and bot_text:
+                extractor.extract_and_save(device_id, user_text, bot_text)
+                log.info("设备记忆提取完成: device=%s", device_id)
+        except Exception:
+            log.exception("设备记忆提取失败: device=%s", device_id)
+    threading.Thread(target=_run, daemon=True).start()
 
 
 class ChatRequestHandler(BaseHTTPRequestHandler):
     """HTTP 请求处理"""
 
-    def __init__(self, chat: ChatHandler, store: SQLiteMemoryStore, user_id: str, *args, **kwargs):
+    def __init__(
+        self,
+        chat: ChatHandler,
+        store: SQLiteMemoryStore,
+        user_id: str,
+        extractor: MemoryExtractor,
+        assembler,
+        *args, **kwargs,
+    ):
         self._chat = chat
         self._store = store
         self._user_id = user_id
+        self._extractor = extractor
+        self._assembler = assembler
         super().__init__(*args, **kwargs)
 
     # 不打印每个请求的日志到终端
@@ -60,28 +122,40 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
     # ── 路由 ──────────────────────────────────────────────
 
     def do_GET(self):
-        if self.path == "/" or self.path == "/index.html":
+        path = urllib.parse.urlparse(self.path).path
+
+        if path == "/" or path == "/index.html":
             self._serve_html()
-        elif self.path == "/api/stats":
+        elif path == "/api/stats":
             self._handle_stats()
-        elif self.path == "/api/memory":
+        elif path == "/api/memory":
             self._handle_memory()
-        elif self.path == "/api/packs":
+        elif path == "/api/packs":
             self._handle_packs()
-        elif self.path == "/api/core":
+        elif path == "/api/core":
             self._handle_core()
-        elif self.path == "/api/history":
+        elif path == "/api/history":
             self._handle_get_history()
         else:
-            self._json_response({"error": "Not Found"}, 404)
+            # 设备 API 路由
+            m = _DEVICE_RE.match(path)
+            if m:
+                device_id, resource = m.group(1), m.group(2)
+                self._handle_device_api(device_id, resource)
+            else:
+                self._json_response({"error": "Not Found"}, 404)
 
     def do_POST(self):
-        if self.path == "/api/chat":
+        path = urllib.parse.urlparse(self.path).path
+
+        if path == "/api/chat":
             self._handle_chat()
-        elif self.path == "/api/clear":
+        elif path == "/api/clear":
             self._handle_clear()
-        elif self.path == "/api/import-history":
+        elif path == "/api/import-history":
             self._handle_import_history()
+        elif _VOLCANO_RE.match(path):
+            self._handle_volcano_callback()
         else:
             self._json_response({"error": "Not Found"}, 404)
 
@@ -245,6 +319,97 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             "messages": messages,
         })
 
+    # ── 火山引擎字幕回调 ──────────────────────────────────
+
+    def _handle_volcano_callback(self):
+        """接收火山引擎字幕回调"""
+        from memory_agent.volcano.decoder import decode_subtitle_message, verify_signature
+
+        if self._assembler is None:
+            self._json_response({"error": "volcano not enabled"}, 503)
+            return
+
+        # 提取 device_id
+        query = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(query)
+        device_id = params.get("device_id", [None])[0]
+        if not device_id:
+            self._json_response({"error": "device_id required"}, 400)
+            return
+
+        body = self._read_body()
+        if body is None:
+            return
+
+        # 签名验证
+        signature = body.get("signature", "")
+        if not verify_signature(signature, settings.volcano_signature):
+            log.warning("签名验证失败: device=%s", device_id)
+            self._json_response({"ok": True})  # 静默拒绝
+            return
+
+        # 解码字幕消息
+        entries = decode_subtitle_message(body)
+        if entries is None:
+            self._json_response({"ok": True})
+            return
+
+        # 存储原始片段（调试/审计）
+        bot_id = settings.volcano_default_bot_id
+        for entry in entries:
+            speaker = "bot" if entry.userId == bot_id else "user"
+            self._store.insert_fragment(
+                device_id=device_id,
+                round_id=entry.roundId,
+                sequence=entry.sequence,
+                speaker=speaker,
+                text=entry.text,
+                definite=entry.definite,
+                paragraph=entry.paragraph,
+            )
+
+        # 组装完整对话轮次
+        completed = self._assembler.process(device_id, entries, bot_id)
+        for user_text, bot_text in completed:
+            _bg_extract_device(self._store, self._extractor, device_id, user_text, bot_text)
+
+        self._json_response({"ok": True, "completed_turns": len(completed)})
+
+    # ── 设备 API ──────────────────────────────────────────
+
+    def _handle_device_api(self, device_id: str, resource: str):
+        """处理 /api/device/<device_id>/<resource> 请求"""
+        if resource == "history":
+            messages = self._store.get_recent_messages(device_id, limit=100)
+            items = [{"role": m["role"], "content": m["content"], "ts": m["ts"]} for m in messages]
+            self._json_response({"device_id": device_id, "messages": items})
+
+        elif resource == "memories":
+            memories = self._store.get_all_memories(device_id)
+            items = [{
+                "id": m.id, "content": m.content, "tier": m.tier,
+                "importance": m.importance, "hit_count": m.hit_count,
+                "pack_id": m.pack_id,
+            } for m in memories]
+            self._json_response({"device_id": device_id, "memories": items})
+
+        elif resource == "stats":
+            stats = self._store.get_stats(device_id)
+            self._json_response({
+                "device_id": device_id,
+                "core_length": stats.core_length,
+                "active_count": stats.active_count,
+                "inactive_count": stats.inactive_count,
+                "pack_count": stats.pack_count,
+            })
+
+        elif resource == "core":
+            core = self._store.get_core_memory(device_id)
+            self._json_response({"device_id": device_id, "core": core})
+
+        else:
+            self._json_response({"error": "Not Found"}, 404)
+
     # ── 静态文件 ──────────────────────────────────────────
 
     def _serve_html(self):
@@ -281,10 +446,12 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
 
 def main(port: int = 8899):
     print(f"初始化记忆系统 ...")
-    chat, store, user_id = _create_app()
-    handler_class = partial(ChatRequestHandler, chat, store, user_id)
+    chat, store, user_id, extractor, assembler = _create_app()
+    handler_class = partial(ChatRequestHandler, chat, store, user_id, extractor, assembler)
     server = HTTPServer(("0.0.0.0", port), handler_class)
     print(f"聊天服务已启动: http://localhost:{port}")
+    if settings.volcano_enabled:
+        print(f"火山引擎回调端点: POST /api/volcano/callback?device_id=xxx")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

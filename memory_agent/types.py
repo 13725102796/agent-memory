@@ -74,3 +74,15 @@ class MemoryStats:
     active_count: int = 0
     inactive_count: int = 0
     pack_count: int = 0
+
+
+@dataclass
+class SubtitleEntry:
+    """火山引擎字幕回调条目"""
+    text: str
+    userId: str
+    sequence: int
+    definite: bool
+    paragraph: bool
+    roundId: int
+    language: str = "zh"

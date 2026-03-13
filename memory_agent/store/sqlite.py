@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -24,6 +25,7 @@ class SQLiteMemoryStore(MemoryStore):
     def __init__(self, db_path: str | None = None):
         self._db_path = db_path or settings.db_path
         self._conn: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
 
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -88,6 +90,22 @@ class SQLiteMemoryStore(MemoryStore):
 
             CREATE INDEX IF NOT EXISTS idx_messages_user
                 ON conversation_messages (user_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS subtitle_fragments (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id   TEXT NOT NULL,
+                round_id    INTEGER NOT NULL,
+                sequence    INTEGER NOT NULL,
+                speaker     TEXT NOT NULL,
+                text        TEXT NOT NULL,
+                definite    INTEGER DEFAULT 0,
+                paragraph   INTEGER DEFAULT 0,
+                received_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(device_id, round_id, sequence, speaker)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fragments_device_round
+                ON subtitle_fragments (device_id, round_id, definite);
         """)
 
         # FTS5 虚拟表需要单独创建（不能放在 executescript 中）
@@ -420,6 +438,36 @@ class SQLiteMemoryStore(MemoryStore):
             return [(row[0], row[1]) for row in rows]
         except sqlite3.OperationalError:
             return []
+
+    # ── 字幕片段存储（火山引擎回调）───────────────────────
+
+    def insert_fragment(
+        self, device_id: str, round_id: int, sequence: int,
+        speaker: str, text: str, definite: bool, paragraph: bool,
+    ) -> None:
+        """存储字幕片段（INSERT OR REPLACE 支持重复投递）"""
+        with self._lock:
+            conn = self._connect()
+            conn.execute("""
+                INSERT OR REPLACE INTO subtitle_fragments
+                    (device_id, round_id, sequence, speaker, text, definite, paragraph)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (device_id, round_id, sequence, speaker, text,
+                  1 if definite else 0, 1 if paragraph else 0))
+            conn.commit()
+
+    def get_fragments_by_round(
+        self, device_id: str, round_id: int,
+    ) -> list[dict]:
+        """查询某轮次的所有片段（调试用）"""
+        with self._lock:
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT * FROM subtitle_fragments "
+                "WHERE device_id = ? AND round_id = ? ORDER BY sequence",
+                (device_id, round_id),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
 
 # ── 内部辅助 ──────────────────────────────────────────────

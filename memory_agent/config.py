@@ -62,6 +62,12 @@ class Settings(BaseSettings):
     reranker_min_score: float = 0.01
     reranker_candidates: int = 10
 
+    # 火山引擎字幕回调
+    volcano_enabled: bool = False
+    volcano_signature: str = ""              # ServerMessageSignature 鉴权
+    volcano_flush_timeout_sec: int = 30      # 无新数据时强制刷新缓冲区
+    volcano_default_bot_id: str = ""         # 默认 Bot ID（区分 AI vs 用户）
+
 
 # 全局单例
 settings = Settings()
