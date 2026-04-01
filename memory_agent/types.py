@@ -2,9 +2,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
 
 import numpy as np
+
+
+class MemoryType(str, Enum):
+    """记忆类型分类（参考 Claude Code memoryTypes.ts 四类型体系）"""
+    USER = "user"           # 用户画像：角色、偏好、技术栈、知识背景
+    FEEDBACK = "feedback"   # 行为指导：该做/不该做、已验证的好做法
+    PROJECT = "project"     # 项目上下文：进度、决策、截止日期、目标
+    REFERENCE = "reference" # 外部资源：文档链接、工具地址、看板位置
 
 
 @dataclass
@@ -21,6 +30,9 @@ class MemoryRecord:
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     pack_id: Optional[str] = None     # 关联的 MemoryPack ID
+    memory_type: MemoryType = MemoryType.PROJECT
+    name: str = ""                    # 短标题（≤50字符）
+    description: str = ""             # 一行描述（≤150字符），用于快速相关性判断
 
 
 @dataclass
@@ -31,6 +43,9 @@ class SearchResult:
     score: float                      # 混合检索最终得分
     tier: str
     pack_id: Optional[str] = None
+    memory_type: MemoryType = MemoryType.PROJECT
+    name: str = ""
+    updated_at: Optional[str] = None  # 用于新鲜度判断
 
 
 @dataclass

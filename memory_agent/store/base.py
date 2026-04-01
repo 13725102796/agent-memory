@@ -125,6 +125,30 @@ class MemoryStore(ABC):
     def mark_messages_packed(self, user_id: str, before_ts: float) -> int:
         ...
 
+    # ── Core Memory 版本化 ────────────────────────────────
+
+    @abstractmethod
+    def save_core_history(self, user_id: str, content: str, reason: str = "") -> None:
+        ...
+
+    @abstractmethod
+    def rollback_core_memory(self, user_id: str) -> bool:
+        ...
+
+    # ── 提取游标 ──────────────────────────────────────────
+
+    @abstractmethod
+    def get_extraction_cursor(self, user_id: str) -> int:
+        ...
+
+    @abstractmethod
+    def set_extraction_cursor(self, user_id: str, cursor_message_id: int) -> None:
+        ...
+
+    @abstractmethod
+    def get_latest_message_id(self, user_id: str) -> int:
+        ...
+
     # ── 初始化 ────────────────────────────────────────────
 
     @abstractmethod
